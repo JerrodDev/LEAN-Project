@@ -11,17 +11,12 @@ class SymbolData:
         self.TriggerBarATR = None
         self.StopLevel = None
         self.PredictionInterval = None
+        self.LastInsight = None
         self.QuoteBarWindow = {}
+        self.TradeBarWindow = {}
         self.FastIsOverSlow = False
         self.IsAboveTrendLine = False
         self.Direction = None
-
-    def ResetComparators(self):
-        #Has fast MA crossed over slow MA
-        self.FastIsOverSlow = self.Fast > self.Slow
-        
-        #Are fast and slow MA above the trend line
-        self.IsAboveTrendLine = self.Fast > self.Trend and self.Slow > self.Trend  
 
     @property
     def SlowIsOverFast(self):

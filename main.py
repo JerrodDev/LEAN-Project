@@ -1,37 +1,36 @@
 from datetime import timedelta
 from AlgorithmImports import *
-from QuantConnect.Algorithm.Framework.Alphas.Analysis import InsightManager
-from Execution.InstantExecutionModel import InstantExecutionModel 
-from PortfolioConstruction.StaticWeightPortfolioConstructionModel import StaticWeightPortfolioConstructionModel
 from SymbolData import SymbolData
 
 
 class sutulpy(QCAlgorithm):  
     def Initialize(self):            
         #Set backtesting variables
-        initialCash = 100000
-        self.SetStartDate(2018, 1, 1)
+        initialCash = 250000
+        self.SetStartDate(2010, 1, 1)
         self.SetEndDate(2020, 1, 1)
         self.SetCash(initialCash)
         self.SetWarmUp(timedelta(days = 20))
-
+        
         #Build a universe set to send to ManualUniverseSelectionModel 
         self.universe = {}       
         self.resolution = Resolution.Daily
-        self.USDJPY = self.AddForex('USDJPY', Resolution.Hour).Symbol
+        self.SYMBOL = self.AddForex('USDJPY', Resolution.Hour).Symbol
         universeSelection = {
-            self.USDJPY
+            self.SYMBOL
         }
         self.SetUniverseSelection(ManualUniverseSelectionModel(universeSelection))
         
         #Alpha Creation        
         self.fastPeriod = 25
         self.slowPeriod = 50
-        self.trendPeriod = 200
-        self.movingAverageType = MovingAverageType.Exponential
-
+        self.trendPeriod = 250
+        self.movingAverageType = MovingAverageType.Simple
+        self.predictionInterval = Time.Multiply(Extensions.ToTimeSpan(self.resolution), self.fastPeriod)
+        
         #Portfolio Construction
-        self.positionSize = initialCash * .01
+        self.portfolioBias = PortfolioBias.LongShort
+        self.positionWeight = 0.01
 
         #Risk Management
         self.atrMultiplier = 1        
@@ -43,22 +42,26 @@ class sutulpy(QCAlgorithm):
         #Skip warm up period
         if self.IsWarmingUp: return
 
-        # Manage risk on all current securities        
+        # Manage risk on all current securities  
+        symbolData = None      
         for kvp in self.Securities:
             # Get underlying symbol  
             symbol = kvp.Key
             security = kvp.Value
 
             #Get symbol data
-            symbolData = self.universe[symbol]
+            if symbol in self.universe:
+                symbolData = self.universe[symbol]
             if symbolData is None:
                 symbolData = SymbolData(security)
 
-            # If data slice contains this symbol
-            if data.ContainsKey(symbol):   
-                # Add QuoteBar to RollingWindow collection 
-                symbolData.QuoteBarWindow[symbol].Add(data[symbol])
+            # If current price crosses over the stop level, liquidate
+            if symbolData.StopLevel is not None:
+                if self.Securities[symbol].Price <= symbolData.StopLevel:
+                    self.Liquidate(symbol, 'Liquidated - Stop Level Hit')  
 
+            # If data slice contains this symbol
+            if security.Invested and data.ContainsKey(symbol):
                 # Initialize trigger bar for symbol on first available data slice, only runs once per symbol instance
                 if symbolData.TriggerBarATR is None and symbolData.AverageTrueRange.IsReady:
                     symbolData.TriggerBarATR = symbolData.AverageTrueRange.Current.Value * self.atrMultiplier
@@ -67,52 +70,73 @@ class sutulpy(QCAlgorithm):
                 if symbolData.StopLevel is None and symbolData.TriggerBarATR is not None:
                     symbolData.StopLevel = data[symbol].Low - symbolData.TriggerBarATR
 
-                # Only apply lookback logic if we have enough records
-                if symbolData.QuoteBarWindow[symbol].Count is 3:
-                    # If the new low on the previous candle is higher than the low before that,
-                    # then the stop level calculation will use this new low
-                    if symbolData.QuoteBarWindow[symbol][1].Low > symbolData.QuoteBarWindow[symbol][2].Low:   
-                        if symbolData.TriggerBarATR is not None:   
-                            symbolData.StopLevel = symbolData.QuoteBarWindow[symbol][1].Low - symbolData.TriggerBarATR    
+                if security.Type is SecurityType.Forex:
+                    # Add QuoteBar to RollingWindow collection 
+                    symbolData.QuoteBarWindow[symbol].Add(data[symbol])
 
-                    # If current price crosses over the stop level, liquidate
-                    if symbolData.StopLevel is not None:
-                        if self.Securities[symbol].Price <= symbolData.StopLevel:
-                            self.Liquidate(symbol)                 
+                    # Only apply lookback logic if we have enough records
+                    if symbolData.QuoteBarWindow[symbol].Count is 3:
+                        # If the new low on the previous candle is higher than the low before that,
+                        # then the stop level calculation will use this new low
+                        if symbolData.QuoteBarWindow[symbol][1].Low > symbolData.QuoteBarWindow[symbol][2].Low:   
+                            if symbolData.TriggerBarATR is not None:   
+                                symbolData.StopLevel = symbolData.QuoteBarWindow[symbol][1].Low - symbolData.TriggerBarATR 
+                elif security.Type is SecurityType.Equity:
+                    # Add QuoteBar to RollingWindow collection 
+                    symbolData.TradeBarWindow[symbol].Add(data[symbol])
+
+                    # Only apply lookback logic if we have enough records
+                    if symbolData.TradeBarWindow[symbol].Count is 3:
+                        # If the new low on the previous candle is higher than the low before that,
+                        # then the stop level calculation will use this new low
+                        if symbolData.TradeBarWindow[symbol][1].Low > symbolData.TradeBarWindow[symbol][2].Low:   
+                            if symbolData.TriggerBarATR is not None:   
+                                symbolData.StopLevel = symbolData.TradeBarWindow[symbol][1].Low - symbolData.TriggerBarATR
+                else:
+                    pass                        
             else:
                 pass
 
             #Emit insights for each symbol in the current universe dictionary
             #Ensure indicators are ready
             if symbolData.Fast is not None and symbolData.Slow is not None and symbolData.Trend is not None and symbolData.AverageTrueRange is not None:
-                if symbolData.Fast.IsReady and symbolData.Slow.IsReady and symbolData.Trend.IsReady and symbolData.AverageTrueRange.IsReady:                
+                if symbolData.Fast.IsReady and symbolData.Slow.IsReady and symbolData.Trend.IsReady and symbolData.AverageTrueRange.IsReady:    
+                    orderFlag = False
+
                     #If we do not have a direction value yet, create one. If we do have data, grab it
                     if symbolData.Direction is None:
                         symbolData.Direction = InsightDirection.Flat
-                
-                    #Reset comparators for next step
-                    symbolData.ResetComparators()
+                        symbolData.LastInsight = self.UtcTime
+                        symbolData.FastIsOverSlow = symbolData.Fast > symbolData.Slow
+                        symbolData.IsAboveTrendLine = symbolData.Fast > symbolData.Trend and symbolData.Slow > symbolData.Trend           
+
+                    symbolData.IsAboveTrendLine = symbolData.Fast > symbolData.Trend and symbolData.Slow > symbolData.Trend 
 
                     #If fast MA has crossed slow MA and is above the trend line
-                    if symbolData.FastIsOverSlow and symbolData.IsAboveTrendLine:
-                        if symbolData.Direction is InsightDirection.Up:
+                    if symbolData.Fast > symbolData.Slow and symbolData.IsAboveTrendLine:
+                        if symbolData.FastIsOverSlow and symbolData.Direction is not InsightDirection.Up:
                             symbolData.Direction = InsightDirection.Up
+                            orderFlag = True
                     #If slow MA has crossed fast MA and is below the trend line
-                    elif symbolData.SlowIsOverFast and symbolData.IsBelowTrendLine:
-                        if symbolData.Direction is not InsightDirection.Down:
+                    elif symbolData.Slow > symbolData.Fast and symbolData.IsBelowTrendLine:
+                        if symbolData.SlowIsOverFast and symbolData.Direction is not InsightDirection.Down:                                                 
                             symbolData.Direction = InsightDirection.Down
-
-                    #If we are not invested
-                    if not security.Invested:
-                        #Create market order for this symbol
-                        quantity = (self.positionSize / symbolData.Security.Price) * symbolData.Direction
+                            orderFlag = True
+                    
+                    if orderFlag:
+                        self.Liquidate(symbol, 'Liquidated - Price Action Change')
+                        target = PortfolioTarget.Percent(self, symbol, (symbolData.Direction if self.RespectPortfolioBias(symbolData) else InsightDirection.Flat) * 0.01)
+                        quantity = OrderSizing.GetUnorderedQuantity(self, target)
                         self.MarketOrder(symbol, quantity)
+
+                    #Reset comparators for next step
+                    symbolData.FastIsOverSlow = symbolData.Fast > symbolData.Slow                     
 
                 else:
                     pass        
 
-                # Add/update symbol data in dictionary
-                self.universe[symbol] = symbolData    
+            # Add/update symbol data in dictionary
+            self.universe[symbol] = symbolData    
 
 
     def OnSecuritiesChanged(self, changes):
@@ -163,8 +187,15 @@ class sutulpy(QCAlgorithm):
             symbolData.AverageTrueRange = self.ATR(added.Symbol, 14, MovingAverageType.Wilders, self.resolution)
 
             #Initialize symbol data properties
-            symbolData.QuoteBarWindow[added.Symbol] = RollingWindow[QuoteBar](3)
+            if added.Type is SecurityType.Forex:
+                symbolData.QuoteBarWindow[added.Symbol] = RollingWindow[QuoteBar](3)
+            elif added.Type is SecurityType.Equity:
+                symbolData.TradeBarWindow[added.Symbol] = RollingWindow[TradeBar](3)
+            else:
+                pass
 
             #Add this symbol data to the universe dictionary
             self.universe[added.Symbol] = symbolData
 
+    def RespectPortfolioBias(self, symbolData):
+        return self.portfolioBias == PortfolioBias.LongShort or symbolData.Direction == self.portfolioBias
